@@ -2,6 +2,7 @@
 require "logstash/inputs/base"
 require "logstash/inputs/threadable"
 require "logstash/namespace"
+require "socket" #for downstream filters, as several rely on it.
 #require "jruby-jms"
 
 # Read events from a Jms Broker. Supports both Jms Queues and Topics.
@@ -189,36 +190,42 @@ class LogStash::Inputs::Jms < LogStash::Inputs::Threadable
 		end
 	end
 
-
-
 	# Consume all available messages on the queue
 	# sleeps some time, then consume again
 	private
 	def run_consumer(output_queue)
-		JMS::Connection.session(@jms_config) do |session|
-			while(true)
-				if (@pub_sub)
-					session.consume(:topic_name => @descriptor, :timeout=>@timeout, :selector => @selector) do |message|
-						queue_event message, output_queue
-					end
-				else
-					session.consume(:queue_name => @descriptor, :timeout=>@timeout, :selector => @selector) do |message|
-						queue_event message, output_queue
-					end
-				end
-				sleep @interval
-			end
-		end
+	  connection = JMS::Connection.new @jms_config
+	  connection.start
+	  session = connection.create_session
+	  
+    if (@pub_sub)
+      @logger.debug("Creating JMS Consumer for topic: [#{@destination}] with selector: [#{@selector}]")
+      consumer = session.consumer(:topic_name => @destination, :selector => @selector)
+    else
+      @logger.debug("Creating JMS Consumer for queue: [#{@destination}] with selector: #{@selector}")
+      consumer = session.consumer(:queue_name => @destination, :selector => @selector)
+    end
+    
+    while(true)
+      begin
+        message = consumer.receive @timeout
+        @logger.debug("Recieved message of type [#{message.class.name}]")
+        queue_event message, output_queue if !message.nil?
+      end while !message.nil?
+      @logger.debug("Sleeping for interval [#{@interval}]")
+      sleep @interval
+    end
 	rescue LogStash::ShutdownSignal
-		# Do nothing, let us quit.
+	  @logger.debug("Closing all JMS connections")
+	  consumer.close
+	  session.close
+	  connection.close
+		# let us quit.
 	rescue => e
 		@logger.warn("JMS Consumer died", :exception => e, :backtrace => e.backtrace)
 		sleep(10)
 		retry
 	end # def run
-
-
-
 
 	# Consume all available messages on the queue through a listener
 	private
